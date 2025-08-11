@@ -1,0 +1,1492 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Enhanced Julia Integration — Caching + WebSocket Preference (Chaos LLM MVP)
+# Contents:
+#   • src/chaos_llm/services/al_uls_client.py         (async HTTP client + TTL cache + stats)
+#   • src/chaos_llm/services/al_uls_ws_client.py       (async WS client + TTL cache + reconnect)
+#   • src/chaos_llm/services/al_uls.py                 (WS-preferred, HTTP fallback, batch)
+#   • src/chaos_llm/services/qgi.py                    (async token apply stores symbolic_results)
+#   • src/chaos_llm/api.py                             (async toggle + batch endpoint + status)
+#   • docker-compose.yml                               (Julia service + healthchecks + env)
+#   • julia_server/Project.toml                        (HTTP + WS + optional DSP/FFTW)
+#   • julia_server/src/Server.jl                       (HTTP + WS + request logging + stats)
+#   • test_enhanced_system.py                          (quick async sanity test)
+#   • README snippets                                  (usage)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# =============================
+# File: src/chaos_llm/services/al_uls_client.py
+# =============================
+import os
+import time
+import asyncio
+from typing import Dict, Any, List, Tuple
+import httpx
+
+JULIA_SERVER_URL = os.environ.get("JULIA_SERVER_URL", "http://localhost:8088")
+CACHE_TTL_SECONDS = float(os.environ.get("ALULS_HTTP_TTL", 30))
+
+class TTLCache:
+    def __init__(self, ttl: float):
+        self.ttl = ttl
+        self._store: Dict[Tuple[str, Tuple[str, ...]], Tuple[float, Dict[str, Any]]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def _now(self) -> float:
+        return time.monotonic()
+
+    def _key(self, name: str, args: List[str]) -> Tuple[str, Tuple[str, ...]]:
+        return (name.upper(), tuple(args))
+
+    def get(self, name: str, args: List[str]) -> Dict[str, Any] | None:
+        k = self._key(name, args)
+        v = self._store.get(k)
+        if not v:
+            self.misses += 1
+            return None
+        ts, data = v
+        if self._now() - ts <= self.ttl:
+            self.hits += 1
+            return data
+        self._store.pop(k, None)
+        self.misses += 1
+        return None
+
+    def set(self, name: str, args: List[str], value: Dict[str, Any]) -> None:
+        self._store[self._key(name, args)] = (self._now(), value)
+
+    def stats(self) -> Dict[str, Any]:
+        return {"entries": len(self._store), "hits": self.hits, "misses": self.misses, "ttl": self.ttl}
+
+class ALULSClient:
+    def __init__(self, base_url: str | None = None):
+        self.base = base_url or JULIA_SERVER_URL
+        self.client = httpx.AsyncClient(timeout=10)
+        self.cache = TTLCache(CACHE_TTL_SECONDS)
+
+    async def health(self) -> Dict[str, Any]:
+        try:
+            r = await self.client.get(f"{self.base}/health")
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def parse(self, text: str) -> Dict[str, Any]:
+        try:
+            r = await self.client.post(f"{self.base}/v1/symbolic/parse", json={"text": text})
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def eval(self, name: str, args: List[str]) -> Dict[str, Any]:
+        cached = self.cache.get(name, args)
+        if cached is not None:
+            return {**cached, "_cached": True}
+        try:
+            r = await self.client.post(f"{self.base}/v1/symbolic/eval", json={"name": name, "args": args})
+            r.raise_for_status()
+            data = r.json()
+            if data.get("ok"):
+                self.cache.set(name, args, data)
+            return data
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def batch_eval(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Use cache per-call; run only misses concurrently
+        to_run: List[Tuple[int, Dict[str, Any]]] = []
+        results: List[Dict[str, Any]] = [{} for _ in calls]
+        for i, c in enumerate(calls):
+            name = c.get("name", "").upper(); args = c.get("args", [])
+            cached = self.cache.get(name, args)
+            if cached is not None:
+                results[i] = {**cached, "_cached": True}
+            else:
+                to_run.append((i, {"name": name, "args": args}))
+        tasks = [self.eval(c["name"], c["args"]) for _, c in to_run]
+        outs = await asyncio.gather(*tasks, return_exceptions=True)
+        for (i, _), out in zip(to_run, outs):
+            results[i] = out if not isinstance(out, Exception) else {"ok": False, "error": str(out)}
+        return results
+
+al_uls_client = ALULSClient()
+
+# =============================
+# File: src/chaos_llm/services/al_uls_ws_client.py
+# =============================
+import os
+import json
+import asyncio
+from typing import Dict, Any, List, Tuple
+import websockets
+
+JULIA_WS_URL = os.environ.get("JULIA_WS_URL", "ws://localhost:8089")
+CACHE_TTL_WS = float(os.environ.get("ALULS_WS_TTL", 30))
+
+class TTLCacheWS:
+    def __init__(self, ttl: float):
+        self.ttl = ttl
+        self._store: Dict[Tuple[str, Tuple[str, ...]], Tuple[float, Dict[str, Any]]] = {}
+        self.hits = 0
+        self.misses = 0
+
+    def _now(self) -> float:
+        return asyncio.get_event_loop().time()
+
+    def _key(self, name: str, args: List[str]) -> Tuple[str, Tuple[str, ...]]:
+        return (name.upper(), tuple(args))
+
+    def get(self, name: str, args: List[str]) -> Dict[str, Any] | None:
+        k = self._key(name, args)
+        v = self._store.get(k)
+        if not v:
+            self.misses += 1; return None
+        ts, data = v
+        if self._now() - ts <= self.ttl:
+            self.hits += 1; return data
+        self._store.pop(k, None)
+        self.misses += 1; return None
+
+    def set(self, name: str, args: List[str], value: Dict[str, Any]) -> None:
+        self._store[self._key(name, args)] = (self._now(), value)
+
+    def stats(self) -> Dict[str, Any]:
+        return {"entries": len(self._store), "hits": self.hits, "misses": self.misses, "ttl": self.ttl}
+
+class ALULSWSClient:
+    def __init__(self, ws_url: str | None = None):
+        self.ws_url = ws_url or JULIA_WS_URL
+        self.websocket: websockets.WebSocketClientProtocol | None = None
+        self.cache = TTLCacheWS(CACHE_TTL_WS)
+
+    async def connect(self):
+        if (self.websocket is None) or self.websocket.closed:
+            self.websocket = await websockets.connect(self.ws_url)
+        return self.websocket
+
+    async def _roundtrip(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            ws = await self.connect()
+            await ws.send(json.dumps(payload))
+            resp = await ws.recv()
+            return json.loads(resp)
+        except Exception as e:
+            # Reset socket on error to force reconnect later
+            try:
+                if self.websocket:
+                    await self.websocket.close()
+            finally:
+                self.websocket = None
+            return {"ok": False, "error": str(e)}
+
+    async def parse(self, text: str) -> Dict[str, Any]:
+        return await self._roundtrip({"type": "parse", "text": text})
+
+    async def eval(self, name: str, args: List[str]) -> Dict[str, Any]:
+        cached = self.cache.get(name, args)
+        if cached is not None:
+            return {**cached, "_cached": True}
+        res = await self._roundtrip({"type": "eval", "name": name, "args": args})
+        if isinstance(res, dict) and res.get("ok"):
+            self.cache.set(name, args, res)
+        return res
+
+    async def batch_eval(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # try a single WS roundtrip; if it fails or invalid, fall back per-call
+        res = await self._roundtrip({"type": "batch_eval", "calls": calls})
+        if isinstance(res, dict) and "results" in res and isinstance(res["results"], list):
+            # populate cache for successes
+            out: List[Dict[str, Any]] = []
+            for c, r in zip(calls, res["results"]):
+                if isinstance(r, dict) and r.get("ok"):
+                    self.cache.set(c.get("name", ""), c.get("args", []), r)
+                out.append(r if isinstance(r, dict) else {"ok": False, "error": "invalid item"})
+            return out
+        # fallback: per-call
+        return [await self.eval(c.get("name", ""), c.get("args", [])) for c in calls]
+
+al_uls_ws_client = ALULSWSClient()
+
+# =============================
+# File: src/chaos_llm/services/al_uls.py
+# =============================
+import os
+from typing import Dict, Any, List, Optional
+from .al_uls_client import al_uls_client
+from .al_uls_ws_client import al_uls_ws_client
+import re
+
+CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)$")
+PREFER_WS = os.environ.get("ALULS_PREFER_WS", "1") in {"1", "true", "TRUE", "yes"}
+
+class ALULS:
+    def is_symbolic_call(self, text: str) -> bool:
+        return bool(CALL_RE.search((text or "").strip()))
+
+    def parse_symbolic_call(self, text: str) -> Dict[str, Any]:
+        m = CALL_RE.search((text or "").strip())
+        if not m:
+            return {"name": None, "args": []}
+        name, argstr = m.group(1), m.group(2)
+        args = [a.strip() for a in argstr.split(",") if a.strip()]
+        return {"name": name.upper(), "args": args}
+
+    async def health(self) -> Dict[str, Any]:
+        # Only HTTP has /health; use it as liveness check
+        return await al_uls_client.health()
+
+    async def eval_symbolic_call_async(self, call: Dict[str, Any]) -> Dict[str, Any]:
+        name = call.get("name", ""); args = call.get("args", [])
+        if PREFER_WS:
+            res = await al_uls_ws_client.eval(name, args)
+            if isinstance(res, dict) and (res.get("ok") or res.get("_cached")):
+                return res
+        return await al_uls_client.eval(name, args)
+
+    async def batch_eval_symbolic_calls(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if PREFER_WS:
+            res = await al_uls_ws_client.batch_eval(calls)
+            # If any valid item present, accept; else fallback
+            if isinstance(res, list) and any(isinstance(r, dict) for r in res):
+                return res
+        return await al_uls_client.batch_eval(calls)
+
+al_uls = ALULS()
+
+# =============================
+# File: src/chaos_llm/services/qgi.py (excerpt showing async apply)
+# =============================
+from typing import Any, Dict, List
+from .entropy_engine import entropy_engine
+from .matrix_processor import matrix_processor
+from .al_uls import al_uls
+from .motif_engine import motif_engine
+from .suggestions import SUGGESTIONS
+
+
+def _prefix_match(prefix: str, state: str) -> List[str]:
+    pre = (prefix or "").upper(); pool = SUGGESTIONS.get(state, [])
+    return [t for t in pool if t.startswith(pre)]
+
+
+def _apply_token_to_qgi(qgi: Dict[str, Any], token_text: str) -> None:
+    entropy_score = entropy_engine.score_token(token_text)
+    volatility_signal = entropy_engine.get_volatility_signal(token_text)
+    qgi.setdefault("entropy_scores", []).append(entropy_score)
+    qgi["volatility"] = volatility_signal
+    if al_uls.is_symbolic_call(token_text):
+        qgi.setdefault("symbolic_calls", []).append(al_uls.parse_symbolic_call(token_text))
+    for t in motif_engine.detect_tags(token_text):
+        if t not in qgi.setdefault("motif_tags", []):
+            qgi["motif_tags"].append(t)
+
+
+async def _apply_token_to_qgi_async(qgi: Dict[str, Any], token_text: str) -> None:
+    _apply_token_to_qgi(qgi, token_text)
+    # Evaluate only the last detected call to keep latency low
+    if qgi.get("symbolic_calls"):
+        last = qgi["symbolic_calls"][ -1]
+        res = await al_uls.eval_symbolic_call_async(last)
+        qgi.setdefault("symbolic_results", []).append(res)
+
+
+async def api_suggest_async(prefix: str = "", state: str = "S0", use_semantic: bool = True) -> Dict[str, Any]:
+    qgi: Dict[str, Any] = {
+        "state": state,
+        "prefix": prefix,
+        "selects": [],
+        "filters": [],
+        "group_by": [],
+        "order": None,
+        "tokens": [],
+        "entropy_scores": [],
+        "volatility": None,
+        "symbolic_calls": [],
+        "symbolic_results": [],
+        "retrieval_routes": [],
+        "motif_tags": []
+    }
+    qgi["tokens"].append(prefix)
+    await _apply_token_to_qgi_async(qgi, prefix)
+    suggestions = matrix_processor.semantic_state_suggest(prefix, state) if use_semantic and matrix_processor.available() else _prefix_match(prefix, state)
+    return {"suggestions": suggestions, "qgi": qgi}
+
+# =============================
+# File: src/chaos_llm/api.py (excerpt: async toggle + batch + status)
+# =============================
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Any, Dict, List
+from .services.qgi import api_suggest, api_suggest_async
+from .services.retrieval import ingest_texts, search
+from .services.unitary_mixer import route_mixture, choose_route
+from .services.al_uls import al_uls
+
+app = FastAPI(title="Chaos LLM MVP", version="0.4.0")
+
+class SuggestRequest(BaseModel):
+    prefix: str = ""
+    state: str = "S0"
+    use_semantic: bool = True
+    async_eval: bool = False
+
+class SuggestResponse(BaseModel):
+    suggestions: List[str]
+    qgi: Dict[str, Any]
+    mixture: Dict[str, float]
+    route: str
+
+class IngestRequest(BaseModel):
+    docs: List[str]
+    namespace: str = "default"
+
+class SearchRequest(BaseModel):
+    query: str
+    namespace: str = "default"
+    top_k: int = 5
+
+class BatchSymbolicRequest(BaseModel):
+    calls: List[Dict[str, Any]]
+
+@app.get("/symbolic/status")
+async def symbolic_status() -> Dict[str, Any]:
+    return await al_uls.health()
+
+@app.post("/batch_symbolic")
+async def batch_symbolic(payload: BatchSymbolicRequest) -> Dict[str, Any]:
+    results = await al_uls.batch_eval_symbolic_calls(payload.calls)
+    return {"results": results}
+
+@app.post("/suggest", response_model=SuggestResponse)
+async def suggest(payload: SuggestRequest) -> SuggestResponse:
+    result = await api_suggest_async(prefix=payload.prefix, state=payload.state, use_semantic=payload.use_semantic) if payload.async_eval \
+             else api_suggest(prefix=payload.prefix, state=payload.state, use_semantic=payload.use_semantic)
+    mixture = route_mixture(result["qgi"]) ; route = choose_route(mixture)
+    result["qgi"].setdefault("retrieval_routes", []).append(route)
+    return SuggestResponse(suggestions=result["suggestions"], qgi=result["qgi"], mixture=mixture, route=route)
+
+# =============================
+# File: docker-compose.yml (healthchecks + env)
+# =============================
+version: "3.9"
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      - MIXER_DEFAULT_SPLIT=0.5
+      - USE_FAISS=0
+      - DATABASE_URL=sqlite+aiosqlite:///./data/qgi.db
+      - JULIA_SERVER_URL=http://julia:8088
+      - JULIA_WS_URL=ws://julia:8089
+      - ALULS_PREFER_WS=1
+      - ALULS_HTTP_TTL=30
+      - ALULS_WS_TTL=30
+    depends_on:
+      julia:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+
+  julia:
+    build:
+      context: .
+      dockerfile: julia_server/Dockerfile
+    ports: ["8088:8088", "8089:8089"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8088/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+# =============================
+# File: julia_server/Project.toml
+# =============================
+name = "ChaosServer"
+uuid = "b3c4b0c1-2a8b-4c3a-9f44-7ad1c2ec9e1f"
+version = "0.2.0"
+
+[deps]
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON3 = "0f8b85d8-1172-5c60-9a20-2f6a0a8b4d9c"
+Symbolics = "0c5d862f-8b57-4792-8d23-62f2024744c7"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+WebSockets = "104b5d7c-3166-5388-85b0-cb73d876171c"
+# Optional advanced math libs (comment in if you implement)
+# DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
+# FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+
+# =============================
+# File: julia_server/src/Server.jl
+# =============================
+module ChaosServer
+
+using HTTP, JSON3, Logging, Dates, Symbolics, WebSockets
+
+const ALLOWED_FUNCS = Set(["SUM","MEAN","VAR","DIFF","SIMPLIFY"])  # extend as needed
+
+struct AppState
+    started_at::DateTime
+    http_count::Int
+    ws_count::Int
+end
+const STATE = Ref{AppState}()
+
+_json(x) = JSON3.write(x)
+
+function _parse_symbolic_call(s::AbstractString)
+    m = match(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)$", strip(s))
+    if m === nothing
+        return Dict("name"=>nothing, "args"=>String[])
+    end
+    name = uppercase(String(m.captures[1]))
+    args_str = String(m.captures[2])
+    args = isempty(strip(args_str)) ? String[] : [strip(x) for x in split(args_str, ",")]
+    return Dict("name"=>name, "args"=>args)
+end
+
+function _eval_symbolic(name::String, args::Vector{String})
+    if !(name in ALLOWED_FUNCS)
+        return Dict("ok"=>false, "error"=>"function not allowed", "name"=>name)
+    end
+    try
+        if name == "SUM"
+            vals = parse.(Float64, args)
+            return Dict("ok"=>true, "result"=>sum(vals))
+        elseif name == "MEAN"
+            vals = parse.(Float64, args)
+            return Dict("ok"=>true, "result"=>sum(vals)/max(length(vals),1))
+        elseif name == "VAR"
+            vals = parse.(Float64, args)
+            μ = sum(vals)/max(length(vals),1)
+            v = sum((x-μ)^2 for x in vals)/max(length(vals),1)
+            return Dict("ok"=>true, "result"=>v)
+        elseif name == "DIFF"
+            f = Symbolics.parse_expr(args[1])
+            sym = Symbolics.parse_expr(args[2])
+            return Dict("ok"=>true, "result"=>string(Symbolics.derivative(f, sym)))
+        elseif name == "SIMPLIFY"
+            expr = Symbolics.parse_expr(args[1])
+            return Dict("ok"=>true, "result"=>string(Symbolics.simplify(expr)))
+        end
+    catch e
+        return Dict("ok"=>false, "error"=>string(e), "name"=>name)
+    end
+end
+
+# HTTP routes
+function route(req::HTTP.Request)
+    try
+        if req.target == "/health"
+            return HTTP.Response(200, _json(Dict(
+                "ok"=>true,
+                "service"=>"Chaos Julia Server",
+                "started_at"=>string(STATE[].started_at),
+                "http_count"=>STATE[].http_count,
+                "ws_count"=>STATE[].ws_count,
+            )))
+        elseif req.target == "/v1/symbolic/parse" && HTTP.method(req) == "POST"
+            data = JSON3.read(String(req.body))
+            parsed = _parse_symbolic_call(get(data, "text", ""))
+            STATE[].http_count += 1
+            return HTTP.Response(200, _json(Dict("ok"=>true, "parsed"=>parsed)))
+        elseif req.target == "/v1/symbolic/eval" && HTTP.method(req) == "POST"
+            data = JSON3.read(String(req.body))
+            name = uppercase(String(get(data, "name", "")))
+            args = Vector{String}(get(data, "args", String[]))
+            result = _eval_symbolic(name, args)
+            STATE[].http_count += 1
+            return HTTP.Response(200, _json(result))
+        else
+            return HTTP.Response(404, _json(Dict("ok"=>false, "error"=>"not found")))
+        end
+    catch e
+        @warn "Route error" error=e
+        return HTTP.Response(500, _json(Dict("ok"=>false, "error"=>string(e))))
+    end
+end
+
+# WebSocket handler
+function ws_handler(ws)
+    try
+        while !eof(ws)
+            data = String(readavailable(ws))
+            msg = JSON3.read(data)
+            if get(msg, "type", "") == "parse"
+                parsed = _parse_symbolic_call(get(msg, "text", ""))
+                write(ws, _json(Dict("type"=>"parse_result", "parsed"=>parsed)))
+            elseif get(msg, "type", "") == "eval"
+                name = uppercase(String(get(msg, "name", "")))
+                args = Vector{String}(get(msg, "args", String[]))
+                result = _eval_symbolic(name, args)
+                write(ws, _json(Dict("type"=>"eval_result", "result"=>result)))
+            elseif get(msg, "type", "") == "batch_eval"
+                calls = get(msg, "calls", [])
+                results = [_eval_symbolic(c["name"], c["args"]) for c in calls]
+                write(ws, _json(Dict("type"=>"batch_eval_result", "results"=>results)))
+            else
+                write(ws, _json(Dict("type"=>"error", "error"=>"unknown message type")))
+            end
+            STATE[].ws_count += 1
+        end
+    catch e
+        @warn "WebSocket error" error=e
+    end
+end
+
+function start(; host="0.0.0.0", http_port::Integer=8088, ws_port::Integer=8089)
+    STATE[] = AppState(now(), 0, 0)
+    @info "Starting Chaos Julia Server" host http_port ws_port
+    @async HTTP.serve(route, host, http_port; verbose=false)
+    @async WebSockets.listen(host, ws_port, ws_handler)
+    @info "Servers started. Ctrl+C to stop."
+    try
+        while true
+            sleep(1)
+        end
+    catch
+        @info "Shutting down"
+    end
+end
+
+end # module
+
+# =============================
+# File: test_enhanced_system.py
+# =============================
+import asyncio
+import os
+
+os.environ.setdefault("JULIA_SERVER_URL", "http://localhost:8088")
+os.environ.setdefault("JULIA_WS_URL", "ws://localhost:8089")
+
+from chaos_llm.services.al_uls_client import al_uls_client
+from chaos_llm.services.al_uls_ws_client import al_uls_ws_client
+
+async def main():
+    print("HTTP health:", await al_uls_client.health())
+    res1 = await al_uls_client.eval("SUM", ["1","2","3"]) ; print("HTTP SUM:", res1)
+    res2 = await al_uls_ws_client.eval("MEAN", ["4","5","6"]) ; print("WS MEAN:", res2)
+    batch = await al_uls_ws_client.batch_eval([
+        {"name":"SUM","args":["1","2","3"]},
+        {"name":"VAR","args":["10","20","30"]}
+    ])
+    print("WS batch:", batch)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# =============================
+# README — usage snippets
+# =============================
+# Build & Run
+# docker compose up --build
+# 
+# Test health:
+#   curl -s localhost:8088/health | jq
+# Async suggest with Julia eval:
+#   curl -sX POST localhost:8000/suggest -H 'content-type: application/json' -d '{"prefix":"VAR(1,2,3)","state":"S0","use_semantic":true,"async_eval":true}' | jq
+# Batch symbolic:
+# 🚀 Phase 3 Evolution: WebSocket Preference + Caching
+
+Let's implement WebSocket preference with HTTP fallback and add caching for repeated symbolic calls!
+✅ 1. Add Caching to AL-ULS Clients
+
+Update src/chaos_llm/services/al_uls_client.py:
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+
+# src/chaos_llm/services/al_uls_client.py
+import os
+import httpx
+import asyncio
+from typing import Dict, Any, List
+from functools import lru_cache
+
+JULIA_SERVER_URL = os.environ.get("JULIA_SERVER_URL", "http://localhost:8088")
+
+class ALULSClient:
+    def __init__(self, base_url: str | None = None):
+        self.base = base_url or JULIA_SERVER_URL
+        self.client = httpx.AsyncClient(timeout=10)
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def _make_cache_key(self, name: str, args: List[str]) -> str:
+        return f"{name}:{'|'.join(args)}"
+
+    async def parse(self, text: str) -> Dict[str, Any]:
+        cache_key = f"parse:{text}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
+        try:
+            r = await self.client.post(f"{self.base}/v1/symbolic/parse", json={"text": text})
+            r.raise_for_status()
+            result = r.json()
+            self._cache[cache_key] = result
+            return result
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def eval(self, name: str, args: List[str]) -> Dict[str, Any]:
+        cache_key = self._make_cache_key(name, args)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
+        try:
+            r = await self.client.post(f"{self.base}/v1/symbolic/eval", json={"name": name, "args": args})
+            r.raise_for_status()
+            result = r.json()
+            self._cache[cache_key] = result
+            return result
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def batch_eval(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Check cache for individual calls
+        cached_results = []
+        uncached_calls = []
+        uncached_indices = []
+        
+        for i, call in enumerate(calls):
+            name = call.get("name", "")
+            args = call.get("args", [])
+            cache_key = self._make_cache_key(name, args)
+            if cache_key in self._cache:
+                cached_results.append((i, self._cache[cache_key]))
+            else:
+                uncached_calls.append(call)
+                uncached_indices.append(i)
+        
+        # Evaluate uncached calls
+        if uncached_calls:
+            tasks = [self.eval(c.get("name", ""), c.get("args", [])) for c in uncached_calls]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            out: List[Dict[str, Any]] = []
+            for res in results:
+                if isinstance(res, Exception):
+                    out.append({"ok": False, "error": str(res)})
+                else:
+                    out.append(res)
+            
+            # Update cache and merge results
+            for idx, result in zip(uncached_indices, out):
+                cache_key = self._make_cache_key(calls[idx].get("name", ""), calls[idx].get("args", []))
+                self._cache[cache_key] = result
+        else:
+            out = []
+        
+        # Reconstruct full results list
+        final_results = [None] * len(calls)
+        for i, result in cached_results:
+            final_results[i] = result
+        for i, result in zip(uncached_indices, out):
+            final_results[i] = result
+            
+        return [r for r in final_results if r is not None]
+
+al_uls_client = ALULSClient()
+
+✅ 2. Enhanced WebSocket Client with Caching
+
+Update src/chaos_llm/services/al_uls_ws_client.py:
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+
+# src/chaos_llm/services/al_uls_ws_client.py
+import os
+import asyncio
+import websockets
+import json
+from typing import Dict, Any, List
+
+JULIA_WS_URL = os.environ.get("JULIA_WS_URL", "ws://localhost:8089")
+
+class ALULSWSClient:
+    def __init__(self, ws_url: str | None = None):
+        self.ws_url = ws_url or JULIA_WS_URL
+        self.websocket: websockets.WebSocketClientProtocol | None = None
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def _make_cache_key(self, name: str, args: List[str]) -> str:
+        return f"{name}:{'|'.join(args)}"
+
+    async def connect(self):
+        if (self.websocket is None) or self.websocket.closed:
+            self.websocket = await websockets.connect(self.ws_url)
+        return self.websocket
+
+    async def _roundtrip(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            ws = await self.connect()
+            await ws.send(json.dumps(payload))
+            resp = await ws.recv()
+            return json.loads(resp)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def parse(self, text: str) -> Dict[str, Any]:
+        cache_key = f"parse:{text}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
+        result = await self._roundtrip({"type": "parse", "text": text})
+        self._cache[cache_key] = result
+        return result
+
+    async def eval(self, name: str, args: List[str]) -> Dict[str, Any]:
+        cache_key = self._make_cache_key(name, args)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
+        result = await self._roundtrip({"type": "eval", "name": name, "args": args})
+        self._cache[cache_key] = result
+        return result
+
+    async def batch_eval(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Check cache for individual calls
+        cached_results = []
+        uncached_calls = []
+        uncached_indices = []
+        
+        for i, call in enumerate(calls):
+            name = call.get("name", "")
+            args = call.get("args", [])
+            cache_key = self._make_cache_key(name, args)
+            if cache_key in self._cache:
+                cached_results.append((i, self._cache[cache_key]))
+            else:
+                uncached_calls.append(call)
+                uncached_indices.append(i)
+        
+        # Evaluate uncached calls via WebSocket
+        if uncached_calls:
+            res = await self._roundtrip({"type": "batch_eval", "calls": uncached_calls})
+            results = res.get("results", []) if isinstance(res, dict) else [{"ok": False, "error": "invalid response"}]
+            
+            # Update cache
+            for idx, result in zip(uncached_indices, results):
+                cache_key = self._make_cache_key(uncached_calls[idx].get("name", ""), uncached_calls[idx].get("args", []))
+                self._cache[cache_key] = result
+        else:
+            results = []
+        
+        # Reconstruct full results list
+        final_results = [None] * len(calls)
+        for i, result in cached_results:
+            final_results[i] = result
+        for i, result in zip(uncached_indices, results):
+            final_results[i] = result
+            
+        return [r for r in final_results if r is not None]
+
+al_uls_ws_client = ALULSWSClient()
+
+✅ 3. Updated AL-ULS with WebSocket Preference
+
+Update src/chaos_llm/services/al_uls.py:
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+
+# src/chaos_llm/services/al_uls.py
+import os
+import re
+from typing import Dict, Any, Optional, List
+from .al_uls_client import al_uls_client
+from .al_uls_ws_client import al_uls_ws_client
+
+CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)$")
+USE_WEBSOCKET = bool(os.environ.get("JULIA_WS_URL"))
+
+class ALULS:
+    def is_symbolic_call(self, text: str) -> bool:
+        return bool(CALL_RE.search((text or "").strip()))
+
+    def parse_symbolic_call(self, text: str) -> Dict[str, Any]:
+        m = CALL_RE.search((text or "").strip())
+        if not m:
+            return {"name": None, "args": []}
+        name, argstr = m.group(1), m.group(2)
+        args = [a.strip() for a in argstr.split(",") if a.strip()]
+        return {"name": name.upper(), "args": args}
+
+    async def eval_symbolic_call_async(self, call: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            if USE_WEBSOCKET:
+                return await al_uls_ws_client.eval(call.get("name", ""), call.get("args", []))
+            else:
+                return await al_uls_client.eval(call.get("name", ""), call.get("args", []))
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    async def batch_eval_symbolic_calls(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if USE_WEBSOCKET:
+            return await al_uls_ws_client.batch_eval(calls)
+        else:
+            return await al_uls_client.batch_eval(calls)
+
+al_uls = ALULS()
+
+✅ 4. Enhanced QGI with Better Caching Integration
+
+Update src/chaos_llm/services/qgi.py:
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+⌄
+
+# src/chaos_llm/services/qgi.py
+from typing import Any, Dict, List
+from .entropy_engine import entropy_engine
+from .matrix_processor import matrix_processor
+from .al_uls import al_uls
+from .motif_engine import motif_engine
+from .suggestions import SUGGESTIONS
+
+def _prefix_match(prefix: str, state: str) -> List[str]:
+    pre = (prefix or "").upper()
+    pool = SUGGESTIONS.get(state, [])
+    return [t for t in pool if t.startswith(pre)]
+
+def _apply_token_to_qgi(qgi: Dict[str, Any], token_text: str) -> None:
+    entropy_score = entropy_engine.score_token(token_text)
+    volatility_signal = entropy_engine.get_volatility_signal(token_text)
+    qgi.setdefault("entropy_scores", []).append(entropy_score)
+    qgi["volatility"] = volatility_signal
+    if al_uls.is_symbolic_call(token_text):
+        symbolic_func = al_uls.parse_symbolic_call(token_text)
+        qgi.setdefault("symbolic_calls", []).append(symbolic_func)
+    tags = motif_engine.detect_tags(token_text)
+    if tags:
+        existing = set(qgi.get("motif_tags", []))
+        for t in tags:
+            if t not in existing:
+                qgi.setdefault("motif_tags", []).append(t)
+                existing.add(t)
+
+async def _apply_token_to_qgi_async(qgi: Dict[str, Any], token_text: str) -> None:
+    _apply_token_to_qgi(qgi, token_text)
+    if qgi.get("symbolic_calls"):
+        last = qgi["symbolic_calls"][-1]
+        res = await al_uls.eval_symbolic_call_async(last)
+        qgi.setdefault("symbolic_results", []).append(res)
+
+def api_suggest(prefix: str = "", state: str = "S0", use_semantic: bool = True) -> Dict[str, Any]:
+    qgi: Dict[str, Any] = {
+        "state": state,
+        "prefix": prefix,
+        "selects": [],
+        "filters": [],
+        "group_by": [],
+        "order": None,
+        "tokens": [],
+        "entropy_scores": [],
+        "volatility": None,
+        "symbolic_calls": [],
+        "symbolic_results": [],
+        "retrieval_routes": [],
+        "motif_tags": []
+    }
+    qgi["tokens"].append(prefix)
+    _apply_token_to_qgi(qgi, prefix)
+    if use_semantic and matrix_processor.available():
+        suggestions = matrix_processor.semantic_state_suggest(prefix, state)
+    else:
+        suggestions = _prefix_match(prefix, state)
+    return {"suggestions": suggestions, "qgi": qgi}
+
+async def api_suggest_async(prefix: str = "", state: str = "S0", use_semantic: bool = True) -> Dict[str, Any]:
+    qgi: Dict[str, Any] = {
+        "state": state,
+        "prefix": prefix,
+        "selects": [],
+        "filters": [],
+        "group_by": [],
+        "order": None,
+        "tokens": [],
+        "entropy_scores": [],
+        "volatility": None,
+        "symbolic_calls": [],
+        "symbolic_results": [],
+        "retrieval_routes": [],
+        "motif_tags": []
+    }
+    qgi["tokens"].append(prefix)
+    await _apply_token_to_qgi_async(qgi, prefix)
+    if use_semantic and matrix_processor.available():
+        suggestions = matrix_processor.semantic_state_suggest(prefix, state)
+    else:
+        suggestions = _prefix_match(prefix, state)
+    return {"suggestions": suggestions, "qgi": qgi}
+
+✅ 5. Update Docker Compose with Cache Volume
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+
+version: "3.9"
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - MIXER_DEFAULT_SPLIT=0.5
+      - USE_FAISS=0
+      - DATABASE_URL=sqlite+aiosqlite:///./data/qgi.db
+      - JULIA_SERVER_URL=http://julia:8088
+      - JULIA_WS_URL=ws://julia:8089
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+      - ./cache:/app/cache  # ← Add cache volume
+    depends_on:
+      - julia
+
+  julia:
+    build:
+      context: .
+      dockerfile: julia_server/Dockerfile
+    ports:
+      - "8088:8088"
+      - "8089:8089"
+
+✅ 6. Enhanced Julia Server with Request Logging
+
+Update julia_server/src/Server.jl:
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+
+# julia_server/src/Server.jl
+module ChaosServer
+
+using HTTP, JSON3, Logging, Dates, Symbolics, WebSockets
+
+const ALLOWED_FUNCS = Set(["SUM","MEAN","VAR","DIFF","SIMPLIFY"])
+const REQUEST_COUNT = Ref(0)
+
+struct AppState
+    started_at::DateTime
+end
+const STATE = Ref{AppState}()
+
+# utils
+_json(x) = JSON3.write(x)
+
+function _parse_symbolic_call(s::AbstractString)
+    m = match(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)$", strip(s))
+    if m === nothing
+        return Dict("name"=>nothing, "args"=>String[])
+    end
+    name = uppercase(String(m.captures[1]))
+    args_str = String(m.captures[2])
+    args = isempty(strip(args_str)) ? String[] : [strip(x) for x in split(args_str, ",")]
+    return Dict("name"=>name, "args"=>args)
+end
+
+function _eval_symbolic(name::String, args::Vector{String})
+    if !(name in ALLOWED_FUNCS)
+        return Dict("ok"=>false, "error"=>"function not allowed", "name"=>name)
+    end
+    try
+        if name == "SUM"
+            vals = parse.(Float64, args)
+            return Dict("ok"=>true, "result"=>sum(vals))
+        elseif name == "MEAN"
+            vals = parse.(Float64, args)
+            return Dict("ok"=>true, "result"=>sum(vals)/max(length(vals),1))
+        elseif name == "VAR"
+            vals = parse.(Float64, args)
+            μ = sum(vals)/max(length(vals),1)
+            v = sum((x-μ)^2 for x in vals)/max(length(vals),1)
+            return Dict("ok"=>true, "result"=>v)
+        elseif name == "DIFF"
+            f = Symbolics.parse_expr(args[1])
+            sym = Symbolics.parse_expr(args[2])
+            return Dict("ok"=>true, "result"=>string(Symbolics.derivative(f, sym)))
+        elseif name == "SIMPLIFY"
+            expr = Symbolics.parse_expr(args[1])
+            return Dict("ok"=>true, "result"=>string(Symbolics.simplify(expr)))
+✅ 7. Example Usage with Caching
+WebSocket Preferred (if JULIA_WS_URL is set):
+1
+2
+3
+4
+5
+
+curl -sX POST localhost:8000/suggest \
+  -H 'content-type: application/json' \
+  -d '{"prefix":"VAR(1,2,3)","state":"S0","use_semantic":true,"async_eval":true}' | jq
+
+Batch with Caching:
+1
+2
+3
+4
+5
+
+curl -sX POST localhost:8000/batch_symbolic \
+  -H 'content-type: application/json' \
+  -d '{"calls":[{"name":"SUM","args":["1","2","3"]},{"name":"MEAN","args":["4","5","6"]}]}' | jq
+
+Health Check (shows request count):
+1
+2
+3
+
+curl -s localhost:8088/health | jq
+
+  curl -sX POST localhost:8000/batch_symbolic -H 'content-type: application/json' -d '{"calls":[{"name":"SUM","args":["1","2","3"]},{"name":"MEAN","args":["4","5","6"]}]}' | jq
