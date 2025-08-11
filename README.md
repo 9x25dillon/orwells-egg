@@ -9,25 +9,32 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+- Set database and optional API key (Postgres recommended):
+
+```bash
+export DATABASE_URL="postgresql+psycopg://limps:limps@localhost:5432/limps"
+# optional auth
+export API_KEY="dev-key"
+```
+
+- Apply `sql/schema.sql` to provision tables:
+
+```bash
+psql "$DATABASE_URL" -f sql/schema.sql
+```
+
 - Start the API:
 
 ```bash
 uvicorn app:app --reload --port 8000
 ```
 
-Endpoints:
-- POST `/pq/lease` — lease a job from AA PQ (stubbed)
-- POST `/rfv/publish` — publish RFV metadata (stubbed)
-- POST `/ds/select` — generate prefix SQL and return a stub `result_uri`
-- POST `/ml2/train_step` — return stub metrics + snapshot id
-
-## Postgres schema
-
-Apply `sql/schema.sql` to provision minimal tables used by AA/IA/DS:
-
-```bash
-psql "$DATABASE_URL" -f sql/schema.sql
-```
+Endpoints (pass header `x-api-key: $API_KEY` if set):
+- POST `/pq/lease` — lease a job from AA PQ (DB-backed)
+- POST `/rfv/publish` — publish RFV metadata (persists to repo tables)
+- POST `/ds/select` — generate prefix SQL and log to `ds_query_log`
+- POST `/ml2/train_step` — stub metrics + coach state update
+- POST `/rfv/snapshot` — demo: create/record an RFV snapshot using a trivial model
 
 ## Optional ML deps
 
@@ -38,8 +45,9 @@ pip install -r requirements-ml.txt
 ```
 
 ## Files
-- `app.py` — FastAPI surface for AA/IA/DS/ML2
-- `ml2_core.py` — CompoundNode, SkipPreserveBlock, gradient normalizers
+- `app.py` — FastAPI surface for AA/IA/DS/ML2 wired to Postgres via SQLAlchemy
+- `db.py` — SQLAlchemy engine, session, and ORM models
+- `ml2_core.py` — CompoundNode, SkipPreserveBlock, gradient & BPTT normalizers
 - `ds_adapter.py` — simple prefix SQL generator
 - `rfv.py` — RFV snapshot helper
 - `coach.py` — entropy-aware coach policy
@@ -52,11 +60,11 @@ Build and run:
 
 ```bash
 docker build -t chaos-aa-ia:latest .
-docker run --rm -p 8000:8000 chaos-aa-ia:latest
+docker run --rm -p 8000:8000 -e DATABASE_URL="postgresql+psycopg://limps:limps@host.docker.internal:5432/limps" -e API_KEY=dev-key chaos-aa-ia:latest
 ```
 
 Test:
 
 ```bash
-curl http://127.0.0.1:8000/healthz
+curl -H "x-api-key: dev-key" http://127.0.0.1:8000/healthz
 ```

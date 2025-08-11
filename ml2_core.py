@@ -40,7 +40,7 @@ class SkipPreserveBlock(nn.Module):
     Insert new layer while preserving old direct connection (skip).
     """
 
-    def __init__(self, in_f: int, hidden_f: int, out_f: int):
+    def __init__(self, in_f: int, out_f: int, hidden_f: int | None = None):
         super().__init__()
         self.new = CompoundNode(in_f, out_f, kinds=("linear", "relu"))
         self.skip = nn.Linear(in_f, out_f, bias=False)  # preserved old path
