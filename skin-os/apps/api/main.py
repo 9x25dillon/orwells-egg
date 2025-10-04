@@ -1,18 +1,25 @@
 from fastapi import FastAPI, Response
 from pydantic import BaseModel
 import asyncio, httpx
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Histogram, Gauge, Counter
 
 from libs.skin.pipeline import Packet, run_skin
 from libs.skin.scheduler import ViscoElasticQueue
 from libs.skin.perfusion import Channel, perfusion_controller
+from libs.entropy.entropy_adapter import EntropyHarness
 from config.settings import JULIA_BASE, CHOPPY_BASE, BASE_CAPACITY, TAU_SECONDS
 
 
-app = FastAPI(title="skin-OS API", version="0.1.0")
+app = FastAPI(title="skin-OS API", version="0.3.0")
+
+# --- entropy metrics ---
+ENTROPY_DELTA = Histogram('skin_os_entropy_delta', 'Entropy delta per packet')
+ENTROPY_LAST = Gauge('skin_os_entropy_last', 'Last observed entropy')
+ENTROPY_TOKENS = Counter('skin_os_entropy_tokens', 'Tokens processed through entropy engine')
 
 # --- global workers & channels ---
 veq = ViscoElasticQueue(base_capacity=BASE_CAPACITY, tau=TAU_SECONDS)
+EH = EntropyHarness()
 
 
 async def choppy_enrich(pkt: Packet):
@@ -33,12 +40,17 @@ async def choppy_enrich(pkt: Packet):
                 "avg_entropy": data.get("metrics", {}).get("avg_entropy"),
             }
             pkt.hydration = min(1.0, pkt.hydration + 0.4)
-            return pkt
     except Exception as e:
         pkt.meta["choppy_error"] = str(e)
     # graceful degrade
     await asyncio.sleep(0.01)
     pkt.hydration = min(1.0, pkt.hydration + 0.1)
+    # Entropy Engine pass (works even if engine absent; adapter degrades)
+    before, after = EH.process(pkt.content)
+    ENTROPY_LAST.set(after)
+    ENTROPY_DELTA.observe(max(0.0, after - before))
+    ENTROPY_TOKENS.inc()
+    pkt.meta["entropy"] = {"before": before, "after": after}
     return pkt
 
 
@@ -94,6 +106,16 @@ async def health():
 async def metrics():
     # Prometheus exposition format
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/entropy/stats")
+async def entropy_stats():
+    return EH.stats()
+
+
+@app.get("/entropy/graph")
+async def entropy_graph():
+    return EH.graph()
 
 
 async def worker_loop():
