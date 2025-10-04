@@ -10,12 +10,13 @@ from libs.entropy.entropy_adapter import EntropyHarness
 from config.settings import JULIA_BASE, CHOPPY_BASE, BASE_CAPACITY, TAU_SECONDS
 
 
-app = FastAPI(title="skin-OS API", version="0.3.0")
+app = FastAPI(title="skin-OS API", version="0.4.0")
 
-# --- entropy metrics ---
+# --- metrics ---
 ENTROPY_DELTA = Histogram('skin_os_entropy_delta', 'Entropy delta per packet')
 ENTROPY_LAST = Gauge('skin_os_entropy_last', 'Last observed entropy')
 ENTROPY_TOKENS = Counter('skin_os_entropy_tokens', 'Tokens processed through entropy engine')
+JULIA_RPC_LAT = Histogram('skin_os_julia_rpc_seconds', 'Latency of Julia RPC calls', ['route'])
 
 # --- global workers & channels ---
 veq = ViscoElasticQueue(base_capacity=BASE_CAPACITY, tau=TAU_SECONDS)
@@ -99,7 +100,7 @@ async def ingest(inp: Ingest):
 
 @app.get("/health")
 async def health():
-    return {"queue": veq.qsize(), "inflow_hz": ctrl["inflow_hz"]}
+    return {"queue": veq.qsize(), "inflow_hz": ctrl["inflow_hz"], "entropy_last": ENTROPY_LAST._value.get()}
 
 
 @app.get("/metrics")
@@ -116,6 +117,56 @@ async def entropy_stats():
 @app.get("/entropy/graph")
 async def entropy_graph():
     return EH.graph()
+
+# ------------------ Julia PolyServe (QVNM / Costa–Hero / Codes / DP) Proxies ------------------
+
+async def _julia_post(path: str, payload: dict):
+    url = f"{JULIA_BASE}{path}"
+    async with httpx.AsyncClient(timeout=20.0) as cl:
+        with JULIA_RPC_LAT.labels(route=path).time():
+            r = await cl.post(url, json=payload)
+    r.raise_for_status()
+    return r.json()
+
+
+@app.post("/qvnm/estimate_id")
+async def qvnm_estimate_id(payload: dict):
+    return await _julia_post("/qvnm/estimate_id", payload)
+
+
+@app.post("/qvnm/build")
+async def qvnm_build(payload: dict):
+    return await _julia_post("/qvnm/build", payload)
+
+
+@app.post("/qvnm/preview")
+async def qvnm_preview(payload: dict):
+    return await _julia_post("/qvnm/preview", payload)
+
+
+@app.post("/qvnm/query")
+async def qvnm_query(payload: dict):
+    return await _julia_post("/qvnm/query", payload)
+
+
+@app.post("/qvnm/query_traj")
+async def qvnm_query_traj(payload: dict):
+    return await _julia_post("/qvnm/query_traj", payload)
+
+
+@app.post("/qvnm/build_codes")
+async def qvnm_build_codes(payload: dict):
+    return await _julia_post("/qvnm/build_codes", payload)
+
+
+@app.post("/cpl/init")
+async def cpl_init(payload: dict):
+    return await _julia_post("/cpl/init", payload)
+
+
+@app.post("/dp/summary")
+async def dp_summary(payload: dict):
+    return await _julia_post("/dp/summary", payload)
 
 
 async def worker_loop():
