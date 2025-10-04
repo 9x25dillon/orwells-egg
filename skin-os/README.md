@@ -4,7 +4,8 @@
 1. python -m venv .venv && source .venv/bin/activate
 2. pip install -r requirements.txt
 3. (optional) run Julia stub: `julia julia/limps_control.jl` and set `JULIA_BASE`
-4. ./scripts/run_dev.sh
+4. export CHOPPY_BASE=http://localhost:9100  # your Choppy FastAPI
+5. ./scripts/run_dev.sh
 
 ## try
 ```bash
@@ -12,6 +13,14 @@ curl -X POST http://localhost:8000/ingest -H 'content-type: application/json' \
   -d '{"content":"hello epidermis","pigment":0.3}'
 
 curl http://localhost:8000/health
+curl http://localhost:8000/metrics  # Prometheus exposition
+
+## metrics (Prometheus)
+- `skin_os_queue_wait_seconds` (histogram)
+- `skin_os_queue_size` (gauge)
+- `skin_os_queue_capacity` (gauge)
+- `skin_os_channel_latency_seconds{channel=...}` (histogram)
+- `skin_os_inflow_hz` (gauge)
 ```
 
 ## Notes & next steps
